@@ -25,6 +25,7 @@ BASELINE = "#c3c2b7"
 SURFACE = "#fcfcfb"
 
 UNIT_RE = re.compile(r"\(([^)]+)\)\s*$")
+MAX_SERIES_PER_PANEL = 6
 
 
 def load_trend_csv(path: Path) -> pd.DataFrame:
@@ -45,10 +46,27 @@ def load_trend_csv(path: Path) -> pd.DataFrame:
     return df
 
 
+def strip_unit(col: str) -> str:
+    """'FCU-5-303/DA-T (°F)' -> 'FCU-5-303/DA-T'; strip the unit BEFORE
+    splitting on a delimiter, since the unit itself can contain one
+    (e.g. 'AC-5-33_RA-P (in/wc)')."""
+    return UNIT_RE.sub("", col).strip()
+
+
+def split_point(col: str) -> tuple[str, str]:
+    """Split a column into (equipment_prefix, point_id), trying the '/' and
+    '_' delimiters BAS exports commonly use between equipment tag and point."""
+    name = strip_unit(col)
+    for delim in ("/", "_"):
+        if delim in name:
+            prefix, point = name.split(delim, 1)
+            return prefix, point
+    return "", name
+
+
 def point_label(col: str) -> str:
     """'FCU-5-303/DA-T (°F)' -> 'DA-T'"""
-    name = col.split("/")[-1]
-    return UNIT_RE.sub("", name).strip()
+    return split_point(col)[1]
 
 
 def point_unit(col: str) -> str:
@@ -63,25 +81,41 @@ def group_columns_by_unit(columns) -> dict:
     return groups
 
 
+def chunk(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def build_figure(df: pd.DataFrame, title: str) -> go.Figure:
     value_cols = [c for c in df.columns if c != "timestamp"]
     groups = group_columns_by_unit(value_cols)
     # Stable, readable panel order: temperature, then percent outputs, then anything else.
-    order = sorted(groups, key=lambda u: (u != "°F", u != "%", u))
-    panel_titles = [f"{unit}" if unit != "status" else "Status" for unit in order]
-    row_heights = [0.6 if unit == "status" else 1.0 for unit in order]
+    units = sorted(groups, key=lambda u: (u != "°F", u != "%", u))
+
+    # A palette has 8 slots and a shared line chart gets unreadable well before
+    # that -- split any unit's columns into multiple panels rather than
+    # cycling (repeating) colors within one panel.
+    panels: list[tuple[str, list[str]]] = []
+    for unit in units:
+        parts = chunk(groups[unit], MAX_SERIES_PER_PANEL)
+        for i, part in enumerate(parts):
+            label = unit if unit != "status" else "Status"
+            if len(parts) > 1:
+                label = f"{label} ({i + 1}/{len(parts)})"
+            panels.append((label, part))
+
+    row_heights = [0.6 if unit == "Status" else 1.0 for unit, _ in panels]
 
     fig = make_subplots(
-        rows=len(order),
+        rows=len(panels),
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.06,
-        subplot_titles=panel_titles,
+        subplot_titles=[label for label, _ in panels],
         row_heights=row_heights,
     )
 
-    for row, unit in enumerate(order, start=1):
-        for i, col in enumerate(groups[unit]):
+    for row, (panel_label, cols) in enumerate(panels, start=1):
+        for i, col in enumerate(cols):
             color = CATEGORICAL[i % len(CATEGORICAL)]
             label = point_label(col)
             fig.add_trace(
@@ -99,7 +133,7 @@ def build_figure(df: pd.DataFrame, title: str) -> go.Figure:
                 col=1,
             )
         fig.update_yaxes(
-            title_text=unit if unit != "status" else "",
+            title_text=panel_label if panel_label != "Status" else "",
             gridcolor=GRIDLINE,
             zerolinecolor=BASELINE,
             linecolor=BASELINE,
@@ -113,7 +147,7 @@ def build_figure(df: pd.DataFrame, title: str) -> go.Figure:
         linecolor=BASELINE,
         tickfont=dict(color=INK_MUTED),
     )
-    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.05), row=len(order), col=1)
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.05), row=len(panels), col=1)
 
     total_weight = sum(row_heights)
     cumulative = 0.0
@@ -160,7 +194,10 @@ def main():
     args = parser.parse_args()
 
     df = load_trend_csv(args.csv_path)
-    point_prefix = next((c.split("/")[0] for c in df.columns if "/" in c), args.csv_path.stem)
+    point_prefix = next(
+        (split_point(c)[0] for c in df.columns if c != "timestamp" and split_point(c)[0]),
+        args.csv_path.stem,
+    )
     start = df["timestamp"].min().strftime("%d %b %Y")
     end = df["timestamp"].max().strftime("%d %b %Y")
     title = f"{point_prefix} Trends — {start} to {end}"
